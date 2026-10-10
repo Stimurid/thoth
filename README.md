@@ -17,6 +17,7 @@ treat all your AI history as one addressable corpus.
 | `codex` | `~/.codex/sessions/<YYYY>/<MM>/<DD>/*.jsonl` + `~/.codex/archived_sessions` + `~/.codex/session_index.jsonl` | one JSONL event stream per session | Codex CLI 0.157.1 |
 | `claude-code` | `~/.claude/projects/<project-slug>/<session-uuid>.jsonl` | one JSONL event stream per session | Claude Code 2.1.283 |
 | `cursor` | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` (SQLite): `composerHeaders` + `cursorDiskKV` bubble rows | one row per composer/chat session, bubbles joined | Cursor 1.x (as of 2026-10) |
+| `chatgpt` | a [Nisaba](https://github.com/Stimurid/nisaba) archive root (pass `--nisaba <dir>`) | indexes existing Nisaba conversations without re-fetching | Nisaba 0.1.0 |
 
 Not yet supported (roadmap, by request):
 - Kilo (Cline successor) inside Cursor — their globalStorage format
@@ -43,8 +44,17 @@ files.
 $env:PYTHONPATH = "src"
 python -m thoth codex --output D:\archives\agents
 
-# All three at once:
+# All three local-agent sources at once:
 python -m thoth all --output D:\archives\agents
+
+# Include a Nisaba ChatGPT archive in the index:
+python -m thoth all --output D:\archives\agents --nisaba D:\archives\chatgpt\primary
+
+# Emit a flat daily digest across all sources (feeds downstream pipelines):
+python -m thoth digest --output D:\archives\agents
+# -> D:\archives\agents\daily_digest.jsonl, one row per session with
+#    { date, source, session_id, title, project_hint, updated_at,
+#      message_count, carrier_paths, extra }
 
 # JSON summary (for CI / scripts):
 python -m thoth all --output D:\archives\agents --json
