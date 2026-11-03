@@ -130,6 +130,7 @@ class SessionRecord:
     session_kind: Optional[str] = None   # DESKTOP / EXECUTION_TRACE / SUBAGENT / UNKNOWN
     client_origin: Optional[str] = None  # verified app-or-executor origin, not model provider
     native_thread_source: Optional[str] = None  # e.g. chatgpt_handoff
+    lineage_refs: List[Dict[str, Any]] = field(default_factory=list)  # exact source-proven edges
 
     def day_folder(self) -> str:
         iso = self.updated_at or self.created_at or now_iso()
@@ -169,6 +170,7 @@ class SessionRecord:
             "session_kind": self.session_kind,
             "client_origin": self.client_origin,
             "native_thread_source": self.native_thread_source,
+            "lineage_refs": self.lineage_refs,
         }
         blob = json.dumps(meta, ensure_ascii=False, sort_keys=True, default=str)
         self.content_fingerprint = "record-v2:" + hashlib.sha256(
@@ -208,6 +210,8 @@ class SessionRecord:
             row["client_origin"] = self.client_origin
         if self.native_thread_source is not None:
             row["native_thread_source"] = self.native_thread_source
+        if self.lineage_refs:
+            row["lineage_refs"] = self.lineage_refs
         return row
 
 
@@ -569,6 +573,7 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
                 "session_kind": row.get("session_kind"),
                 "client_origin": row.get("client_origin"),
                 "native_thread_source": row.get("native_thread_source"),
+                "lineage_refs": row.get("lineage_refs") or [],
             }
             digest_row = {
                 "schema": DIGEST_SCHEMA,

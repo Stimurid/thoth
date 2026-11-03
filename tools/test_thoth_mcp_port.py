@@ -72,6 +72,26 @@ class ThothMcpTests(unittest.TestCase):
         self.assertEqual(p["matching"], 3)
         self.assertTrue(all(not row["owner_reviewed_merge"] for row in p["projects"]))
 
+    def test_kimi_proven_import_edge_is_metadata_only(self):
+        row = app._card({
+            "source": "kimi-code",
+            "account_id": "kimi-instance-a",
+            "session_id": "ses-123",
+            "lineage_refs": [{
+                "relation": "IMPORTED_FROM",
+                "source": "claude-code",
+                "session_id": "claude-123",
+                "imported_at": "2026-11-02T00:00:00Z",
+                "evidence": "KIMI_STATE_CUSTOM_IMPORT_FIELDS",
+                "messages": [{"text": "RAW_SOURCE_BODY"}],
+            }],
+            "body": "RAW_SOURCE_BODY",
+        })
+        self.assertEqual(row["lineage_refs"][0]["source"], "claude-code")
+        self.assertEqual(row["lineage_refs"][0]["session_id"], "claude-123")
+        self.assertNotIn("RAW_SOURCE_BODY", json.dumps(row))
+        self.assertFalse(row["cross_provider_resume_proven"])
+
     def test_inputs_and_missing_config(self):
         with self.assertRaises(ValueError):
             app.search_sessions("x" * 161)
