@@ -127,6 +127,9 @@ class SessionRecord:
     native_project_id: Optional[str] = None
     native_thread_id: Optional[str] = None
     open_hint: Optional[str] = None   # e.g. codex://threads/<uuid> — hint only
+    session_kind: Optional[str] = None   # DESKTOP / EXECUTION_TRACE / SUBAGENT / UNKNOWN
+    client_origin: Optional[str] = None  # verified app-or-executor origin, not model provider
+    native_thread_source: Optional[str] = None  # e.g. chatgpt_handoff
 
     def day_folder(self) -> str:
         iso = self.updated_at or self.created_at or now_iso()
@@ -163,6 +166,9 @@ class SessionRecord:
             "message_count": self.message_count,
             "capture_status": self.capture_status,
             "open_hint": self.open_hint,
+            "session_kind": self.session_kind,
+            "client_origin": self.client_origin,
+            "native_thread_source": self.native_thread_source,
         }
         blob = json.dumps(meta, ensure_ascii=False, sort_keys=True, default=str)
         self.content_fingerprint = "record-v2:" + hashlib.sha256(
@@ -196,6 +202,12 @@ class SessionRecord:
             row["native_thread_id"] = self.native_thread_id
         if self.open_hint is not None:
             row["open_hint"] = self.open_hint
+        if self.session_kind is not None:
+            row["session_kind"] = self.session_kind
+        if self.client_origin is not None:
+            row["client_origin"] = self.client_origin
+        if self.native_thread_source is not None:
+            row["native_thread_source"] = self.native_thread_source
         return row
 
 
@@ -534,10 +546,8 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
             row = latest[key]
             ts = row.get("updated_at") or row.get("created_at") or ""
             date = ts[:10] if ts else ""
-            # Strip any accidental body fields from extra for catalog safety.
-            extra = dict(row.get("extra") or {})
-            extra.pop("events", None)
-            extra.pop("body", None)
+            # Strict catalog allowlist. Historical extra may contain nested
+            # raw transcript or credential-like values; never forward it.
             catalog_row = {
                 "schema": CATALOG_SCHEMA,
                 "identity_key": key,
@@ -556,7 +566,9 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
                 "version": row.get("version"),
                 "carrier_paths": row.get("carrier_paths") or [],
                 "open_hint": row.get("open_hint"),
-                "extra": extra,
+                "session_kind": row.get("session_kind"),
+                "client_origin": row.get("client_origin"),
+                "native_thread_source": row.get("native_thread_source"),
             }
             digest_row = {
                 "schema": DIGEST_SCHEMA,
@@ -570,6 +582,11 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
         fdig.flush()
         os.fsync(fcat.fileno())
         os.fsync(fdig.fileno())
+    # A pair of file renames cannot be a single filesystem transaction.
+    # The manifest is the commit marker: consumers must verify both hashes
+    # before declaring the generation complete; a crash is detectable.
+    catalog_hash = hashlib.sha256(catalog_tmp.read_bytes()).hexdigest()
+    digest_hash = hashlib.sha256(digest_tmp.read_bytes()).hexdigest()
     os.replace(catalog_tmp, catalog_path)
     os.replace(digest_tmp, digest_path)
 
@@ -580,12 +597,51 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
         "sessions": n,
         "sources": sources,
         "legacy_codex_rows_folded": folded_legacy_codex,
+        "generation": token,
+        "catalog_sha256": catalog_hash,
+        "digest_sha256": digest_hash,
+        "committed": True,
         "built_at": now_iso(),
     }
-    (root / "unified_catalog.manifest.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8",
-    )
+    manifest_tmp = root / f".unified_catalog.manifest.{token}.tmp"
+    with manifest_tmp.open("x", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(manifest_tmp, root / "unified_catalog.manifest.json")
     return meta
+
+
+def verify_unified_generation(root: Path) -> Dict[str, Any]:
+    """Require committed checksums for versioned catalog/digest generation.
+
+    A crash between replacing two files leaves old/new checksum mismatch,
+    which downstream clients can detect instead of silently treating two
+    different generations as coherent.
+    """
+    manifest = root / "unified_catalog.manifest.json"
+    if not manifest.is_file():
+        return {"status": "UNVERIFIED_LEGACY", "reason": "NO_MANIFEST"}
+    try:
+        meta = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"status": "INCOMPLETE", "reason": "BAD_MANIFEST"}
+    checksums = (("catalog_sha256", "unified_catalog.jsonl"),
+                 ("digest_sha256", "daily_digest.jsonl"))
+    if not meta.get("committed") or any(not meta.get(k) for k, _ in checksums):
+        return {"status": "UNVERIFIED_LEGACY", "reason": "NO_COMMITTED_HASHES"}
+    for field, name in checksums:
+        path = root / name
+        if not path.is_file():
+            return {"status": "INCOMPLETE", "reason": "MISSING_" + name}
+        with path.open("rb") as stream:
+            digest = hashlib.sha256()
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        if digest.hexdigest() != meta[field]:
+            return {"status": "INCOMPLETE", "reason": "HASH_MISMATCH_" + name}
+    return {"status": "COMMITTED", "generation": meta.get("generation"),
+            "built_at": meta.get("built_at")}
 
 
 def query_catalog(
@@ -599,9 +655,15 @@ def query_catalog(
     limit: int = 100,
 ) -> List[Dict[str, Any]]:
     """Bounded JSON query over unified_catalog.jsonl (rebuild if missing)."""
+    if not isinstance(limit, int) or limit <= 0:
+        raise ValueError("THOTH_QUERY_LIMIT_INVALID")
+    limit = min(limit, 100)
     catalog = root / "unified_catalog.jsonl"
     if not catalog.is_file():
         build_unified_catalog(root)
+    generation = verify_unified_generation(root)
+    if generation.get("status") == "INCOMPLETE":
+        raise RuntimeError("THOTH_CATALOG_GENERATION_INCOMPLETE:" + str(generation.get("reason")))
     out: List[Dict[str, Any]] = []
     if not catalog.is_file():
         return out

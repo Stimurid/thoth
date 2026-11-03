@@ -14,7 +14,9 @@ Input shape (Nisaba 0.1.0):
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
@@ -35,6 +37,14 @@ from thoth.common import (
 
 
 NisabaSpec = Union[Path, Tuple[Path, Optional[str]], Dict[str, Any]]
+_UUID = re.compile(r"^[a-fA-F0-9]{8}-(?:[a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$")
+
+
+def _scalar(value: Any, *, limit: int = 160) -> Optional[str]:
+    """Only bounded primitive source metadata may enter the index."""
+    if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+        return str(value)[:limit]
+    return None
 
 
 def _read_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
@@ -86,6 +96,14 @@ def normalize_nisaba_specs(
             root = Path(spec)
         account_id = stable_source_id(label, root)
         out.append((root, account_id))
+    # Explicit account label collision would silently merge two archives.
+    # Fail before writing any index if two roots claim the same identity.
+    owners: Dict[str, str] = {}
+    for root, identity in out:
+        canonical = str(root.resolve()).casefold()
+        if identity in owners and owners[identity] != canonical:
+            raise ValueError("NISABA_ACCOUNT_LABEL_COLLISION")
+        owners[identity] = canonical
     return out
 
 
@@ -97,7 +115,13 @@ def _conv_to_record(
     account_manifest: Dict[str, Any],
 ) -> SessionRecord:
     cid = str(listing.get("conversation_id") or "")
-    cdir = nisaba_root / "conversations" / cid
+    # Conversation IDs come from external archive listings, not our own paths.
+    # Never accept traversal, a drive prefix, or a path-like value here.
+    valid_cid = bool(_UUID.fullmatch(cid))
+    cdir = nisaba_root / "conversations" / (cid if valid_cid else "_invalid_id_")
+    # A valid UUID directory can itself be a symlink; do not follow it.
+    if valid_cid and (cdir.is_symlink() or not cdir.resolve().is_relative_to((nisaba_root / "conversations").resolve())):
+        valid_cid = False
     conv_json = cdir / "conversation.json"
     md_path = cdir / "conversation.md"
 
@@ -107,21 +131,21 @@ def _conv_to_record(
         created = to_iso_utc(created)
     if isinstance(updated, (int, float)):
         updated = to_iso_utc(updated)
-    title = listing.get("title") or "Untitled"
-    project_id = listing.get("project_id") or listing.get("gizmo_id")
-    project_name = listing.get("project_name")
+    title = _scalar(listing.get("title")) or "Untitled"
+    project_id = _scalar(listing.get("project_id") or listing.get("gizmo_id"))
+    project_name = _scalar(listing.get("project_name"))
 
     message_count = 0
     events: List[Dict[str, Any]] = []
     capture = CAPTURE_POINTER
     carriers: List[str] = []
 
-    if not cid:
+    if not valid_cid:
         capture = CAPTURE_PARTIAL
         fp = fingerprint_metadata(updated, str(title), 0, capture)
         return SessionRecord(
             source="chatgpt",
-            session_id="missing-id",
+            session_id="invalid-" + hashlib.sha256(cid.encode("utf-8", "replace")).hexdigest()[:20],
             title=str(title)[:160],
             created_at=created if isinstance(created, str) else to_iso_utc(created),
             updated_at=updated if isinstance(updated, str) else to_iso_utc(updated),
@@ -131,11 +155,11 @@ def _conv_to_record(
             account_id=account_id,
             capture_status=capture,
             content_fingerprint=fp,
-            extra={"error": "listing_missing_conversation_id", "nisaba_root": str(nisaba_root)},
+            extra={"error": "listing_invalid_conversation_id", "nisaba_root": str(nisaba_root)},
             events=[],
         )
 
-    if conv_json.is_file():
+    if valid_cid and not conv_json.is_symlink() and conv_json.is_file():
         carriers.append(str(conv_json))
         try:
             body = json.loads(conv_json.read_text(encoding="utf-8"))
@@ -151,7 +175,7 @@ def _conv_to_record(
                 "path": str(conv_json),
                 "mapping_entries": message_count,
             }]
-            if md_path.is_file():
+            if valid_cid and not md_path.is_symlink() and md_path.is_file():
                 carriers.append(str(md_path))
                 events.append({"ref": "conversation.md", "path": str(md_path)})
         except Exception as err:
@@ -159,7 +183,7 @@ def _conv_to_record(
             events = [{"ref": "conversation.json", "path": str(conv_json), "error": str(err)}]
     else:
         capture = CAPTURE_PARTIAL
-        if md_path.is_file():
+        if valid_cid and not md_path.is_symlink() and md_path.is_file():
             carriers.append(str(md_path))
             events = [{"ref": "conversation.md", "path": str(md_path)}]
 
@@ -172,9 +196,9 @@ def _conv_to_record(
     )
 
     manifest_meta = {
-        k: account_manifest.get(k)
-        for k in ("account_label", "email_hint", "export_id", "exported_at", "source")
-        if k in account_manifest
+        k: _scalar(account_manifest.get(k), limit=100)
+        for k in ("account_label", "export_id", "exported_at", "source")
+        if k in account_manifest and _scalar(account_manifest.get(k), limit=100)
     }
     # Never copy secrets from manifest; only non-credential labels.
     for banned in ("token", "password", "cookie", "authorization", "api_key"):
@@ -185,7 +209,9 @@ def _conv_to_record(
             "project_id": project_id,
             "project_name": project_name,
             "archived": bool(listing.get("archived")),
-            "memberships": listing.get("memberships") or [],
+            # Raw memberships may contain nested messages, tokens or bodies.
+            # Native project_id is the sole allowed membership evidence here.
+            "membership_source": "NISABA_INDEX_PROJECT_ID_ONLY",
         },
         "nisaba_conversation_dir": str(cdir),
         "nisaba_root": str(nisaba_root),

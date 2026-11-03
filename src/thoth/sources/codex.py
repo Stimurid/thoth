@@ -216,7 +216,7 @@ def load_desktop_thread_index(
             "id", "rollout_path", "created_at", "updated_at", "cwd", "title",
             "name", "first_user_message", "project_id", "creator_account_id",
             "creator_user_id", "created_at_ms", "updated_at_ms", "source",
-            "model", "archived",
+            "model", "archived", "originator", "thread_source", "agent_role",
         ]
         # Version fallback: select only columns that exist.
         try:
@@ -250,6 +250,9 @@ def load_desktop_thread_index(
                 "creator_account_id": row.get("creator_account_id"),
                 "creator_user_id": row.get("creator_user_id"),
                 "source": row.get("source"),
+                "originator": row.get("originator"),
+                "thread_source": row.get("thread_source"),
+                "agent_role": row.get("agent_role"),
                 "model": row.get("model"),
                 "archived": row.get("archived"),
             }
@@ -272,6 +275,21 @@ def _account_label(creator_account_id: Any) -> Optional[str]:
     return f"codex-acct-{digest}"
 
 
+def _codex_session_kind(thread: Dict[str, Any]) -> str:
+    """Distinguish Desktop conversations from executable and subagent traces."""
+    origin = str(thread.get("originator") or "")
+    source = str(thread.get("source") or "")
+    if source.startswith("{") or thread.get("agent_role"):
+        return "CODEX_SUBAGENT"
+    if origin in ("Codex Desktop", "codex_work_desktop"):
+        return "CODEX_DESKTOP"
+    if origin == "codex_exec":
+        return "CODEX_EXEC"
+    if source == "vscode":
+        return "CODEX_VSCODE"
+    return "UNKNOWN"
+
+
 def enrich_from_desktop(rec: SessionRecord, thread: Dict[str, Any]) -> SessionRecord:
     """Merge Desktop SQLite metadata into a rollout-backed record."""
     if thread.get("title"):
@@ -282,6 +300,9 @@ def enrich_from_desktop(rec: SessionRecord, thread: Dict[str, Any]) -> SessionRe
         rec.project_hint = thread["project_roots"][0]
     rec.native_project_id = thread.get("project_id")
     rec.native_thread_id = thread.get("id") or rec.session_id
+    rec.session_kind = _codex_session_kind(thread)
+    rec.client_origin = str(thread.get("originator") or "UNKNOWN")[:100]
+    rec.native_thread_source = str(thread.get("thread_source") or "UNKNOWN")[:100]
     acct = _account_label(thread.get("creator_account_id"))
     if acct:
         rec.account_id = acct
@@ -336,6 +357,9 @@ def _metadata_only_record(thread: Dict[str, Any]) -> SessionRecord:
         native_project_id=thread.get("project_id"),
         native_thread_id=tid,
         open_hint=f"codex://threads/{tid}" if _UUID_RE.fullmatch(tid) else None,
+        session_kind=_codex_session_kind(thread),
+        client_origin=str(thread.get("originator") or "UNKNOWN")[:100],
+        native_thread_source=str(thread.get("thread_source") or "UNKNOWN")[:100],
         extra={
             "codex_desktop": {
                 "thread_id": tid,

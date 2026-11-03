@@ -11,6 +11,7 @@ Opened read-only with WAL-safe URI fallbacks. Never mutates Cursor state.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -173,8 +174,9 @@ def _load_composer(
         },
     }
 
-    # Fingerprint from header timestamps + bubble count (DB has no single carrier file).
-    fp = fingerprint_metadata(updated_iso, title, len(events), CAPTURE_FULL)
+    # Bubble content can change without header updatedAt or event count.
+    blob = json.dumps(events, ensure_ascii=False, sort_keys=True, default=str)
+    fp = "cursor-events:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
 
     return SessionRecord(
         source="cursor",

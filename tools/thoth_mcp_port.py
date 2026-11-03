@@ -64,6 +64,9 @@ def _card(row):
         "project_hint": val("project_hint", 280),
         "updated_at": val("updated_at", 48),
         "capture_status": val("capture_status", 30),
+        "session_kind": val("session_kind", 64),
+        "client_origin": val("client_origin", 100),
+        "native_thread_source": val("native_thread_source", 100),
         "open_hint": val("open_hint", 320),
         "carrier_paths": [str(x)[:400] for x in (row.get("carrier_paths") or [])[:5]
                           if isinstance(x, str)],
@@ -84,10 +87,13 @@ def status():
     all_rows = list(_rows())
     counts = Counter(x.get("source") or "UNKNOWN" for x in all_rows)
     capture = Counter(x.get("capture_status") or "UNKNOWN" for x in all_rows)
+    kinds = Counter((x.get("source") or "UNKNOWN", x.get("session_kind") or "UNKNOWN") for x in all_rows)
     accounts = Counter((str(x.get("source") or ""), str(x.get("account_id") or "UNKNOWN"))
                        for x in all_rows)
     return {"ok": True, **_receipt(), "total_records": len(all_rows),
             "sources": dict(counts), "capture_status_counts": dict(capture),
+            "session_kind_counts": [{"source": source, "kind": kind, "sessions": n}
+                                    for (source, kind), n in sorted(kinds.items())],
             "account_instances": [{"source": a, "account_id": b, "sessions": n}
                                   for (a, b), n in sorted(accounts.items())]}
 
