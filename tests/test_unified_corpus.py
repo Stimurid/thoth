@@ -443,6 +443,7 @@ class TestCliSmoke(unittest.TestCase):
             # claude/cursor homes absent -> skipped cleanly
             os.environ["CLAUDE_HOME"] = str(tmp_path / "missing_claude")
             os.environ["CURSOR_STATE_DB"] = str(tmp_path / "missing_cursor.vscdb")
+            os.environ["KIMI_CODE_HOME"] = str(tmp_path / "missing_kimi")
             import io
             from contextlib import redirect_stdout
             buf = io.StringIO()

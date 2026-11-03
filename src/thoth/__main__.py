@@ -1,7 +1,7 @@
 """Thoth CLI: `python -m thoth <command> [options]`.
 
 Commands:
-    codex | claude-code | cursor | chatgpt    collect one source
+    codex | claude-code | cursor | kimi-code | chatgpt    collect one source
     all                                       collect all local-agent sources
     digest | catalog                          emit unified metadata catalog + daily digest
     query                                     bounded JSON query over unified catalog
@@ -35,6 +35,9 @@ def _run_source(
     if src == "cursor":
         from thoth.sources.cursor import collect
         return collect(out, since=watermark, full=full)
+    if src == "kimi-code":
+        from thoth.sources.kimi_code import collect
+        return collect(out, since=watermark, full=full)
     if src == "chatgpt":
         from thoth.sources.nisaba_archive import collect
         if not nisaba_roots:
@@ -59,9 +62,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "command",
-        choices=("codex", "claude-code", "cursor", "chatgpt", "all", "digest", "catalog", "query"),
+        choices=("codex", "claude-code", "cursor", "kimi-code", "chatgpt", "all", "digest", "catalog", "query"),
         help=(
-            "`codex|claude-code|cursor|chatgpt` collects one source; "
+            "`codex|claude-code|cursor|kimi-code|chatgpt` collects one source; "
             "`all` runs local-agent collectors (plus chatgpt if --nisaba is given); "
             "`digest`/`catalog` emit unified_catalog.jsonl + daily_digest.jsonl; "
             "`query` runs a bounded metadata query."
@@ -133,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     nisaba_accounts: List[Optional[str]] = list(args.nisaba_accounts or [])
 
     if args.command == "all":
-        sources = ["codex", "claude-code", "cursor"]
+        sources = ["codex", "claude-code", "cursor", "kimi-code"]
         if nisaba_roots:
             sources.append("chatgpt")
     else:

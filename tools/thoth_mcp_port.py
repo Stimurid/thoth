@@ -54,6 +54,18 @@ def _card(row):
     def val(k, limit=280):
         v = row.get(k)
         return str(v)[:limit] if v is not None else None
+    safe_edges = []
+    for edge in (row.get("lineage_refs") or [])[:8]:
+        if not isinstance(edge, dict):
+            continue
+        safe_edges.append({
+            "relation": str(edge.get("relation") or "")[:40],
+            "source": str(edge.get("source") or "")[:50],
+            "session_id": str(edge.get("session_id") or "")[:200],
+            "imported_at": str(edge.get("imported_at") or "")[:48],
+            "evidence": str(edge.get("evidence") or "")[:70],
+            "cross_provider_resume_proven": False,
+        })
     return {
         "source": val("source", 60),
         "account_id": val("account_id", 160),
@@ -70,6 +82,7 @@ def _card(row):
         "open_hint": val("open_hint", 320),
         "carrier_paths": [str(x)[:400] for x in (row.get("carrier_paths") or [])[:5]
                           if isinstance(x, str)],
+        "lineage_refs": safe_edges,
         "raw_body_included": False,
         "cross_provider_resume_proven": False,
     }
