@@ -82,3 +82,13 @@ Thoth never calls live cloud endpoints, never switches accounts, never mutates c
 - Thoth Git snapshot inventory ([thoth#1](https://github.com/Stimurid/thoth/issues/1))
 - Hub/Hestia live route switch (later ordered stage)
 - Mutation of scheduled daily Windows task / live archive trees
+
+## Stage-1 verified interoperability (2026-11-04)
+
+Producer format is **JSONL**: each line of `unified_catalog.jsonl` carries `schema=thoth.unified_catalog.v1` and one source-account-session identity. The file is NOT one large JSON object with a `sessions` array. Consumers must stream and page it rather than requesting the entire corpus as one native-message payload. `unified_catalog.manifest.json` records the catalog's build timestamp and global record count.
+
+The HYDRA source reader is implemented in the existing HYDRA Project Mosaic candidate branch (separate owner) and reads the producer's JSONL format from an owner-configured Thoth root, with a 250-row bounded page and `offset`/`nextOffset`/`totalRows` information. The reader does not duplicate archive bodies and never writes into the producer root.
+
+Source correctness: a globally recent watermark is **not** a completeness proof for old newly discovered sessions; source identity plus fingerprint controls the incremental decision. A carrier's unchanged mtime/size is **not** evidence that project/title metadata is unchanged; the index fingerprint includes both. Historical no-account rollout rows fold into an attributed canonical Codex row only where exactly one observed account fits the UUID. When more than one account matches, retain ambiguity rather than conflate accounts.
+
+AORUS isolated test: one real Nisaba indexing pass from the two source roots yielded 1,659 records (1,393 + 266) and a second unchanged pass wrote zero new versions. This is a snapshot and not a universal completeness assertion; source archives are separately maintained by Nisaba. Native Codex SQLite read-only indexing was verified for 1,338 threads and 23 native project records (snapshot). Original ThothDaily and original archives were not edited during the isolated probe.

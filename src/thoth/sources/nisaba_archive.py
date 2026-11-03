@@ -142,7 +142,10 @@ def _conv_to_record(
             mapping = body.get("mapping") or {}
             message_count = len(mapping)
             created = to_iso_utc(body.get("create_time")) or created
-            updated = to_iso_utc(body.get("update_time")) or updated
+            body_updated = to_iso_utc(body.get("update_time"))
+            # The listing may be fresher than a stale/incomplete saved body.
+            if body_updated and (not updated or body_updated > updated):
+                updated = body_updated
             events = [{
                 "ref": "conversation.json",
                 "path": str(conv_json),

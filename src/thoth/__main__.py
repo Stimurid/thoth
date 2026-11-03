@@ -70,8 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--output", required=True, type=Path,
                    help="root output directory. Each source gets a subdir.")
     p.add_argument("--since", default=None,
-                   help="ISO UTC soft watermark for brand-new session ids. "
-                        "Per-session fingerprints still detect older changed sessions. "
+                   help="Compatibility hint only; never suppresses newly discovered historical "
+                        "session ids. Per-session fingerprints determine changes. "
                         "Default: resume from <output>/<source>/index.jsonl.")
     p.add_argument("--full", action="store_true",
                    help="force re-index every session (new ledger versions). "

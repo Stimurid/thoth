@@ -6,6 +6,11 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+import sys
+
+# Keep the standard Hub test command (`python -m unittest discover -s tests`)
+# valid in a source checkout without installing the project.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from thoth.common import (
     CAPTURE_METADATA_ONLY,
@@ -290,6 +295,73 @@ class TestIncrementality(unittest.TestCase):
             _write_jsonl(rollout, events)
             r = collect_codex(out, home=home, state_db=home / "state_5.sqlite", full=False)
             self.assertGreaterEqual(r["new_sessions_this_run"], 1)
+
+
+class TestIncrementalSafetyRegressions(unittest.TestCase):
+    def test_new_historical_session_not_suppressed_by_global_watermark(self):
+        from thoth.common import read_watermark
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = root / "nisaba_recent"
+            b = root / "nisaba_old"
+            _build_nisaba_root(a, SHARED_UUID, title="Recent", updated="2026-11-03T00:00:00Z")
+            _build_nisaba_root(b, OLD_UUID, title="Discovered old", updated="2025-01-01T00:00:00Z")
+            out = root / "out"
+            first = collect_nisaba(out, nisaba_roots=[a], nisaba_accounts=["a"])
+            cutoff = read_watermark(out, "chatgpt")
+            self.assertEqual(first["new_sessions_this_run"], 1)
+            self.assertEqual(cutoff, "2026-11-03T00:00:00Z")
+            second = collect_nisaba(
+                out, nisaba_roots=[b], nisaba_accounts=["b"], since=cutoff,
+            )
+            self.assertEqual(second["new_sessions_this_run"], 1)
+            rows = load_session_ledger(out, "chatgpt")
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(second["per_account"][0]["skipped_as_old"], 0)
+
+    def test_nisaba_title_only_change_in_existing_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nisaba = root / "nisaba"
+            _build_nisaba_root(
+                nisaba, SHARED_UUID, title="Original", updated="2026-11-03T00:00:00Z",
+            )
+            out = root / "out"
+            first = collect_nisaba(out, nisaba_roots=[nisaba], nisaba_accounts=["primary"])
+            self.assertEqual(first["new_sessions_this_run"], 1)
+            listing = nisaba / "conversations.jsonl"
+            with listing.open(encoding="utf-8") as f:
+                row = json.loads(f.readline())
+            row["title"] = "Renamed ChatGPT conversation"
+            _write_jsonl(listing, [row])
+            second = collect_nisaba(out, nisaba_roots=[nisaba], nisaba_accounts=["primary"])
+            self.assertEqual(second["new_sessions_this_run"], 1)
+            third = collect_nisaba(out, nisaba_roots=[nisaba], nisaba_accounts=["primary"])
+            self.assertEqual(third["new_sessions_this_run"], 0)
+            ledger = load_session_ledger(out, "chatgpt")
+            item = next(iter(ledger.values()))
+            self.assertEqual(item["title"], "Renamed ChatGPT conversation")
+            self.assertEqual(item["version"], 2)
+
+    def test_catalog_folds_legacy_codex_only_when_one_account_proven(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            index = out / "codex" / "index.jsonl"
+            old = dict(source="codex", session_id=LEGACY_STEM, title="Rollout",
+                       created_at="2026-01-02T00:00:00Z", updated_at="2026-01-03T00:00:00Z")
+            modern = dict(source="codex", session_id=SHARED_UUID,
+                          account_id="codex-acct-A", identity_key="codex:codex-acct-A:" + SHARED_UUID,
+                          title="Canonical title", version=1, capture_status="FULL")
+            _write_jsonl(index, [old, modern])
+            meta = build_unified_catalog(out)
+            self.assertEqual(meta["sessions"], 1)
+            self.assertEqual(meta["legacy_codex_rows_folded"], 1)
+            modern2 = dict(modern, account_id="codex-acct-B",
+                           identity_key="codex:codex-acct-B:" + SHARED_UUID)
+            _write_jsonl(index, [old, modern, modern2])
+            meta2 = build_unified_catalog(out)
+            self.assertEqual(meta2["sessions"], 3)
+            self.assertEqual(meta2["legacy_codex_rows_folded"], 0)
 
 
 class TestPartialRecovery(unittest.TestCase):

@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,6 +50,9 @@ def to_iso_utc(value: Any) -> Optional[str]:
             return None
         try:
             dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            # Carrier timestamps without an offset are UTC, not host-local.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
             return None
@@ -137,11 +142,32 @@ class SessionRecord:
         return make_identity_key(self.source, self.account_id, self.session_id)
 
     def ensure_fingerprint(self) -> str:
-        if self.content_fingerprint:
+        """Fingerprint carrier evidence AND metadata; a renamed project is an update.
+
+        A source-level carrier stat alone misses native Codex title/project/account
+        updates and Nisaba listing-only changes. Record fingerprints include both.
+        """
+        if (self.content_fingerprint or "").startswith("record-v2:"):
             return self.content_fingerprint
-        self.content_fingerprint = fingerprint_carriers(self.carrier_paths) or fingerprint_metadata(
-            self.updated_at, self.title, self.message_count, self.capture_status
-        )
+        carrier = self.content_fingerprint or fingerprint_carriers(self.carrier_paths) or "absent"
+        meta = {
+            "source": self.source,
+            "session_id": self.session_id,
+            "account_id": self.account_id,
+            "title": self.title,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "project_hint": self.project_hint,
+            "native_project_id": self.native_project_id,
+            "native_thread_id": self.native_thread_id,
+            "message_count": self.message_count,
+            "capture_status": self.capture_status,
+            "open_hint": self.open_hint,
+        }
+        blob = json.dumps(meta, ensure_ascii=False, sort_keys=True, default=str)
+        self.content_fingerprint = "record-v2:" + hashlib.sha256(
+            (carrier + "|" + blob).encode("utf-8", "replace")
+        ).hexdigest()[:24]
         return self.content_fingerprint
 
     def index_row(self, *, version: int = 1) -> Dict[str, Any]:
@@ -334,6 +360,10 @@ def _row_identity(row: Dict[str, Any]) -> Optional[str]:
     sid = row.get("session_id")
     if not source or not sid:
         return None
+    # Legacy Codex index IDs were rollout-YYYY...-<uuid>, with no
+    # identity_key. Normalize when materializing old append-only data.
+    if str(source) == "codex":
+        sid = extract_uuid(str(sid)) or str(sid)
     return make_identity_key(str(source), row.get("account_id"), str(sid))
 
 
@@ -384,14 +414,10 @@ def should_emit(
     fp = rec.ensure_fingerprint()
     prev = ledger.get(key)
     if prev is None:
-        # New session: optional global since gate still applies as a soft
-        # filter for brand-new ids discovered after a watermark.
-        ts = rec.updated_at or rec.created_at or ""
-        if since and ts and ts <= since:
-            # Still emit if caller wants discovery of METADATA gaps etc.;
-            # for brand-new keys below watermark we skip to preserve
-            # historical incremental behaviour.
-            return False, "new_but_not_after_watermark"
+        # A global high-watermark is not a safe exclusion test. A newly
+        # discovered old session can legitimately predate the newest archived
+        # session (restored device, delayed Nisaba export, historical import).
+        # Only per-session source identity and fingerprint establish novelty.
         return True, "new"
     prev_fp = prev.get("content_fingerprint")
     if prev_fp and prev_fp == fp:
@@ -476,10 +502,34 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
             if int(row.get("version") or 0) >= int(prev.get("version") or 0):
                 latest[key] = row
 
+    # Legacy Codex rows had no account and a rollout-prefixed session id.
+    # Fold them into a current account-labeled row only if the UUID resolves
+    # to exactly ONE observed account. Never conflate two known accounts.
+    known_codex: Dict[str, set[str]] = {}
+    for key, row in latest.items():
+        if row.get("source") == "codex" and row.get("account_id"):
+            uid = extract_uuid(str(row.get("session_id") or ""))
+            if uid:
+                known_codex.setdefault(uid, set()).add(key)
+    folded_legacy_codex = 0
+    for key, row in list(latest.items()):
+        if row.get("source") != "codex" or row.get("account_id"):
+            continue
+        uid = extract_uuid(str(row.get("session_id") or ""))
+        matches = known_codex.get(uid or "", set())
+        if len(matches) == 1 and key not in matches:
+            # The append-only historical source row stays intact.
+            del latest[key]
+            folded_legacy_codex += 1
+
+    # Preserve the previous complete catalog if a collection is interrupted.
     catalog_path = root / "unified_catalog.jsonl"
     digest_path = root / "daily_digest.jsonl"
+    token = uuid.uuid4().hex
+    catalog_tmp = root / f".unified_catalog.{token}.tmp"
+    digest_tmp = root / f".daily_digest.{token}.tmp"
     n = 0
-    with catalog_path.open("w", encoding="utf-8") as fcat, digest_path.open("w", encoding="utf-8") as fdig:
+    with catalog_tmp.open("w", encoding="utf-8") as fcat, digest_tmp.open("w", encoding="utf-8") as fdig:
         for key in sorted(latest.keys()):
             row = latest[key]
             ts = row.get("updated_at") or row.get("created_at") or ""
@@ -516,6 +566,12 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
             fcat.write(json.dumps(catalog_row, ensure_ascii=False) + "\n")
             fdig.write(json.dumps(digest_row, ensure_ascii=False) + "\n")
             n += 1
+        fcat.flush()
+        fdig.flush()
+        os.fsync(fcat.fileno())
+        os.fsync(fdig.fileno())
+    os.replace(catalog_tmp, catalog_path)
+    os.replace(digest_tmp, digest_path)
 
     meta = {
         "schema": CATALOG_SCHEMA,
@@ -523,6 +579,7 @@ def build_unified_catalog(root: Path) -> Dict[str, Any]:
         "digest": str(digest_path),
         "sessions": n,
         "sources": sources,
+        "legacy_codex_rows_folded": folded_legacy_codex,
         "built_at": now_iso(),
     }
     (root / "unified_catalog.manifest.json").write_text(
