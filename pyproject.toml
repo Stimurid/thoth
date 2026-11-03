@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thoth"
-version = "0.1.0"
-description = "Cold archive of locally-stored AI agent chats. Codex CLI, Claude Code, Cursor Composer. Incremental, per-day sliced, project-tagged. Companion to Nisaba."
+version = "0.2.0"
+description = "Cold archive of locally-stored AI agent chats plus multi-account Nisaba ChatGPT index. Codex Desktop enrichment, per-session incrementality, unified metadata catalog. Companion to Nisaba."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }

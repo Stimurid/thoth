@@ -5,45 +5,50 @@ On-disk shape (observed 2026-10-10):
 
 Tables:
     composerHeaders  — one row per Composer/Chat session
-        composerId, workspaceId, createdAt (ms), lastUpdatedAt (ms),
-        isArchived, isSubagent, recency, checkpointAt, subagentTypeName,
-        value (JSON blob with head metadata)
-    cursorDiskKV      — key-value, keys like `bubbleId:<composerId>:<bubbleId>`
-        each row's value is a JSON blob with the bubble content, type, etc.
+    cursorDiskKV      — bubble payloads keyed bubbleId:<composerId>:<bubbleId>
 
-Note: Cursor state is often locked / being written to by a live Cursor
-process. We open the DB in URI mode `?mode=ro&immutable=1` which snapshots
-the view at the time of connect and never writes.
-
-Also: not every composer in composerHeaders has bubbles persisted —
-sessions deleted from the UI may still appear in headers with 0 bubbles.
+Opened read-only with WAL-safe URI fallbacks. Never mutates Cursor state.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from thoth.common import SessionRecord, to_iso_utc
+from thoth.common import (
+    CAPTURE_FULL,
+    CAPTURE_PARTIAL,
+    SessionRecord,
+    append_index,
+    fingerprint_metadata,
+    load_session_ledger,
+    next_version,
+    open_sqlite_readonly,
+    should_emit,
+    to_iso_utc,
+    write_manifest,
+    write_session,
+)
 
 
-DEFAULT_DB = Path(os.environ.get("CURSOR_STATE_DB") or (
-    Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
-    / "Cursor" / "User" / "globalStorage" / "state.vscdb"
-))
+def _default_db() -> Path:
+    return Path(os.environ.get("CURSOR_STATE_DB") or (
+        Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+        / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    ))
 
-# Workspace id -> folder path (readable project hint)
-DEFAULT_WORKSPACE_STORAGE = Path(os.environ.get("CURSOR_WORKSPACE_STORAGE") or (
-    Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
-    / "Cursor" / "User" / "workspaceStorage"
-))
+
+def _default_workspace_storage() -> Path:
+    return Path(os.environ.get("CURSOR_WORKSPACE_STORAGE") or (
+        Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+        / "Cursor" / "User" / "workspaceStorage"
+    ))
 
 
 def _read_workspace_map(ws_root: Path) -> Dict[str, str]:
-    """Map workspaceId (dir name) -> readable folder URL. Best-effort."""
     out: Dict[str, str] = {}
     if not ws_root.is_dir():
         return out
@@ -73,7 +78,6 @@ def _ms_to_iso(ms: Any) -> Optional[str]:
 
 
 def _bubble_text(value: Any) -> str:
-    """Best-effort extraction of displayable text from a bubble payload."""
     if isinstance(value, (bytes, bytearray)):
         value = value.decode("utf-8", errors="replace")
     if isinstance(value, str):
@@ -90,7 +94,6 @@ def _bubble_text(value: Any) -> str:
                 tt = v.get("text") or v.get("content")
                 if isinstance(tt, str) and tt.strip():
                     return tt
-        # fall back to a short JSON representation
         try:
             return json.dumps(value, ensure_ascii=False)[:4000]
         except Exception:
@@ -120,7 +123,6 @@ def _load_composer(
     cid, ws_id, created_ms, updated_ms, is_archived, is_subagent, _rec, _ckpt, _stype, header_val = header_row
     head = _parse_header_value(header_val)
 
-    # bubbles for this composer
     cur = conn.execute(
         "SELECT key, value FROM cursorDiskKV WHERE key LIKE ? ORDER BY key",
         (f"bubbleId:{composer_id}:%",),
@@ -135,8 +137,6 @@ def _load_composer(
             payload = {"_raw": str(raw)[:1000]}
         bubble_id = key.split(":", 2)[2] if key.count(":") >= 2 else key
         text = _bubble_text(payload)
-        # best-effort role from type: cursor's `type` field is numeric;
-        # 1 = user, 2 = assistant (empirically; may be wrong, keep raw too)
         ptype = payload.get("type") if isinstance(payload, dict) else None
         role = {1: "user", 2: "assistant"}.get(ptype, f"type_{ptype}") if ptype is not None else "unknown"
         events.append({
@@ -148,9 +148,8 @@ def _load_composer(
         })
 
     if not events and head.get("type") != "head":
-        return None  # empty and no head info — skip
+        return None
 
-    # title from head.value if any, else first user bubble
     title = head.get("name") or head.get("title") or ""
     if not title:
         for ev in events:
@@ -162,7 +161,6 @@ def _load_composer(
 
     created_iso = _ms_to_iso(created_ms) or _ms_to_iso(head.get("createdAt"))
     updated_iso = _ms_to_iso(updated_ms) or _ms_to_iso(head.get("lastUpdatedAt")) or created_iso
-
     project_hint = ws_folder or (ws_id or "")
 
     extra = {
@@ -176,6 +174,10 @@ def _load_composer(
         },
     }
 
+    # Bubble content can change without header updatedAt or event count.
+    blob = json.dumps(events, ensure_ascii=False, sort_keys=True, default=str)
+    fp = "cursor-events:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:24]
+
     return SessionRecord(
         source="cursor",
         session_id=composer_id,
@@ -184,7 +186,10 @@ def _load_composer(
         updated_at=updated_iso,
         project_hint=project_hint or None,
         message_count=len(events),
-        carrier_paths=[],
+        carrier_paths=[f"cursor-db:{composer_id}"],
+        capture_status=CAPTURE_FULL if events else CAPTURE_PARTIAL,
+        content_fingerprint=fp,
+        native_thread_id=composer_id,
         extra=extra,
         events=events,
     )
@@ -196,34 +201,39 @@ def collect(
     db: Optional[Path] = None,
     workspace_storage: Optional[Path] = None,
     since: Optional[str] = None,
+    full: bool = False,
     include_empty: bool = False,
 ) -> Dict[str, Any]:
-    db = db or DEFAULT_DB
-    ws_root = workspace_storage or DEFAULT_WORKSPACE_STORAGE
+    db = db or _default_db()
+    ws_root = workspace_storage or _default_workspace_storage()
     if not db.is_file():
         return {"source": "cursor", "skipped": True, "reason": f"db not found: {db}"}
 
-    from thoth.common import write_session, append_index, write_manifest
-
+    ledger = load_session_ledger(out_root, "cursor")
     ws_map = _read_workspace_map(ws_root)
 
-    uri = f"file:{db}?mode=ro&immutable=1"
     try:
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.OperationalError as e:
+        conn = open_sqlite_readonly(db)
+    except (sqlite3.OperationalError, OSError) as e:
         return {"source": "cursor", "skipped": True, "reason": f"db open failed: {e}"}
 
-    cur = conn.execute(
-        "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, "
-        "isSubagent, recency, checkpointAt, subagentTypeName, value "
-        "FROM composerHeaders"
-    )
-    header_rows = cur.fetchall()
+    try:
+        cur = conn.execute(
+            "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, "
+            "isSubagent, recency, checkpointAt, subagentTypeName, value "
+            "FROM composerHeaders"
+        )
+        header_rows = cur.fetchall()
+    except sqlite3.Error as e:
+        conn.close()
+        return {"source": "cursor", "skipped": True, "reason": f"query failed: {e}"}
 
     rows: List[Dict[str, Any]] = []
     new_count = 0
+    skipped_unchanged = 0
     skipped_old = 0
     skipped_empty = 0
+    partial_count = 0
 
     for header in header_rows:
         composer_id = header[0]
@@ -236,11 +246,20 @@ def collect(
         if not include_empty and rec.message_count == 0:
             skipped_empty += 1
             continue
-        if since and (rec.updated_at or rec.created_at or "") <= since:
-            skipped_old += 1
+        if rec.capture_status == CAPTURE_PARTIAL:
+            partial_count += 1
+        emit, reason = should_emit(rec, ledger, since=since, force=full)
+        if not emit:
+            if reason == "unchanged_fingerprint":
+                skipped_unchanged += 1
+            else:
+                skipped_old += 1
             continue
+        ver = next_version(ledger, rec.identity_key())
         write_session(out_root, rec)
-        rows.append(rec.index_row())
+        row = rec.index_row(version=ver)
+        rows.append(row)
+        ledger[rec.identity_key()] = row
         new_count += 1
 
     conn.close()
@@ -253,15 +272,21 @@ def collect(
         "composer_headers_total": len(header_rows),
         "workspaces_mapped": len(ws_map),
         "new_sessions_this_run": new_count,
+        "skipped_unchanged": skipped_unchanged,
         "skipped_as_old": skipped_old,
         "skipped_empty": skipped_empty,
+        "partial_this_run": partial_count,
         "since_watermark": since,
+        "unique_sessions_indexed": len(load_session_ledger(out_root, "cursor")),
     })
     return {
         "source": "cursor",
         "db": str(db),
         "composer_headers_total": len(header_rows),
         "new_sessions_this_run": new_count,
+        "skipped_unchanged": skipped_unchanged,
         "skipped_as_old": skipped_old,
         "skipped_empty": skipped_empty,
+        "partial_this_run": partial_count,
+        "unique_sessions": len(load_session_ledger(out_root, "cursor")),
     }

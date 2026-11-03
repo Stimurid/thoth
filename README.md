@@ -3,112 +3,104 @@
 Named after the Egyptian god of writing and scribes — pair for
 [Nisaba](https://github.com/Stimurid/nisaba) in function. Where Nisaba
 walks the ChatGPT web account, Thoth walks the files that **local AI
-agents** leave on your disk.
+agents** leave on your disk, and indexes **both** Nisaba ChatGPT archival
+roots into one provenance-aware, metadata-only unified catalog.
 
-A unified cold archive of locally-stored agent chat history, with
-incremental daily collection, per-day slicing, per-project tagging, and
-a uniform output layout shared with Nisaba so a downstream pipeline can
-treat all your AI history as one addressable corpus.
+Owner line: `THOTH-UNIFIED-CORPUS-001` ([issue #2](https://github.com/Stimurid/thoth/issues/2)).
+Downstream HYDRA contract: [`docs/HYDRA_INTEGRATION.md`](docs/HYDRA_INTEGRATION.md).
 
-## Supported sources (0.1.0)
+## Supported sources (0.2.0)
 
-| source | reads from | shape | tested at |
+| source | reads from | shape | notes |
 |---|---|---|---|
-| `codex` | `~/.codex/sessions/<YYYY>/<MM>/<DD>/*.jsonl` + `~/.codex/archived_sessions` + `~/.codex/session_index.jsonl` | one JSONL event stream per session | Codex CLI 0.157.1 |
-| `claude-code` | `~/.claude/projects/<project-slug>/<session-uuid>.jsonl` | one JSONL event stream per session | Claude Code 2.1.283 |
-| `cursor` | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` (SQLite): `composerHeaders` + `cursorDiskKV` bubble rows | one row per composer/chat session, bubbles joined | Cursor 1.x (as of 2026-10) |
-| `chatgpt` | a [Nisaba](https://github.com/Stimurid/nisaba) archive root (pass `--nisaba <dir>`) | indexes existing Nisaba conversations without re-fetching | Nisaba 0.1.0 |
+| `codex` | `~/.codex/sessions` + `archived_sessions` + **Desktop** `state_5.sqlite` (read-only) | rollout JSONL + thread/project enrichment | UUID-normalized; `METADATA_ONLY` for SQLite threads without rollout |
+| `claude-code` | `~/.claude/projects/<project-slug>/<session-uuid>.jsonl` | one JSONL event stream per session | per-session fingerprints |
+| `cursor` | `%APPDATA%/Cursor/User/globalStorage/state.vscdb` | composer headers + bubbles | RO SQLite with WAL fallback |
+| `chatgpt` | one or more [Nisaba](https://github.com/Stimurid/nisaba) archive roots (`--nisaba`, repeatable) | pointer index into Nisaba; no body re-copy | account labels prevent UUID collisions across accounts |
 
-Not yet supported (roadmap, by request):
-- Kilo (Cline successor) inside Cursor — their globalStorage format
-- OpenCode — not installed on test machine
-- Cline legacy state (retired on test machine; schema still readable)
-- MCP servers' persisted conversation state
+Not yet supported (roadmap): Kilo, OpenCode, Cline legacy, MCP server conversation stores.
 
 ## Install
 
 ```powershell
-# No dependencies beyond stdlib.
-# Clone or pip-install directly:
+# No dependencies beyond stdlib. Python 3.11+.
 git clone https://github.com/Stimurid/thoth
 cd thoth
 ```
 
-Python 3.11+. No `curl_cffi` or other deps — this reads only local
-files.
-
 ## Use
 
 ```powershell
-# One source:
 $env:PYTHONPATH = "src"
+
+# One source
 python -m thoth codex --output D:\archives\agents
 
-# All three local-agent sources at once:
-python -m thoth all --output D:\archives\agents
+# All local agents + both Nisaba ChatGPT archives
+python -m thoth all --output D:\archives\agents `
+  --nisaba D:\archives\chatgpt\primary --nisaba-account primary `
+  --nisaba D:\archives\chatgpt\account2 --nisaba-account account2
 
-# Include a Nisaba ChatGPT archive in the index:
-python -m thoth all --output D:\archives\agents --nisaba D:\archives\chatgpt\primary
+# Unified catalog + daily digest (also auto-built after collect runs)
+python -m thoth catalog --output D:\archives\agents --json
 
-# Emit a flat daily digest across all sources (feeds downstream pipelines):
-python -m thoth digest --output D:\archives\agents
-# -> D:\archives\agents\daily_digest.jsonl, one row per session with
-#    { date, source, session_id, title, project_hint, updated_at,
-#      message_count, carrier_paths, extra }
-
-# JSON summary (for CI / scripts):
-python -m thoth all --output D:\archives\agents --json
+# Bounded metadata query for HYDRA / Hub
+python -m thoth query --output D:\archives\agents --source chatgpt --account account2 --limit 50
 ```
 
-**Incremental resume is default.** Thoth reads `index.jsonl` of each
-source and only emits sessions with `updated_at` **after** the newest
-previously recorded. Pass `--full` to ignore the watermark, or `--since
-2026-01-01T00:00:00Z` to force an explicit cutoff.
+**Per-session incrementality is default.** Thoth keeps an append-only version
+ledger per `identity_key` and skips unchanged content fingerprints. An older
+session that grows after a newer global watermark is still re-indexed.
+`--full` forces new ledger versions; it does not delete the archive or mutate
+provider stores. `--since` remains a soft gate for brand-new ids.
 
 ## Output layout
 
 ```
 <output>/
 ├── codex/
-│   ├── sessions/<YYYY>/<MM>/<DD>/<session_id>.jsonl   # verbatim events
-│   ├── sessions/<YYYY>/<MM>/<DD>/<session_id>.md      # readable render
-│   ├── index.jsonl                                    # append-only per session
-│   └── manifest.json                                  # summary / watermark
+│   ├── sessions/<YYYY>/<MM>/<DD>/<session_id>.jsonl   # verbatim events (FULL)
+│   ├── sessions/<YYYY>/<MM>/<DD>/<session_id>.md
+│   ├── index.jsonl                                    # append-only version ledger
+│   └── manifest.json                                  # unique vs row counts
 ├── claude-code/   (same layout)
-└── cursor/        (same layout)
+├── cursor/        (same layout)
+├── chatgpt/       (index + manifest only; pointers into Nisaba)
+├── unified_catalog.jsonl          # latest metadata row per identity_key
+├── unified_catalog.manifest.json
+└── daily_digest.jsonl             # same rows + date field
 ```
 
-The per-day slicing (`sessions/<YYYY>/<MM>/<DD>/`) is the pivot point
-that lets you feed everything into a dated pipeline: a "what did I
-discuss yesterday" query is just `ls <output>/*/sessions/<yesterday>/`.
+`capture_status`: `FULL` | `POINTER` | `METADATA_ONLY` | `PARTIAL`.
 
-Each session's `.md` has YAML frontmatter with `source`, `id`, `title`,
-`created_at`, `updated_at`, `project_hint` — these drop straight into a
-downstream project-tagging stage.
+## Codex Desktop vs Codex Cloud
+
+Thoth enriches from **local** Desktop SQLite + rollouts only. Codex CLI
+`cloud list|status|diff` is a cloud-task surface, **not** ChatGPT
+Projects/conversations API. `codex://threads/<uuid>` open hints are
+navigation hints — not proof of cross-account continuation. Thoth does not
+call live cloud endpoints or switch accounts.
+
+## Tests
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m unittest discover -s tests -v
+```
+
+Synthetic fixtures only — no private conversation content in the repo.
 
 ## Daily routine
 
-See `scripts/install-daily-task.ps1` to register a Windows Scheduled
-Task that calls `python -m thoth all --output <...>` once a day.
+See `scripts/install-daily-task.ps1`. This upgrade does **not** alter the
+live scheduled task; owners update that separately after acceptance.
 
 ## Caveats
 
-- **Cursor DB may be locked** while Cursor is running. Thoth opens with
-  `mode=ro&immutable=1` which gives a stable snapshot even against a
-  live writer, but very fresh writes (seconds-old) may be invisible
-  until Cursor flushes.
-- **"Session" is a mild lie for Codex/Claude Code.** Both tools call
-  these files "rollouts" or "project sessions"; the semantic unit is a
-  conversation turn, not a Session with capital S. Thoth normalizes.
-- **Cursor `type` field decoding is empirical** — I decoded `1=user,
-  2=assistant`; other values show up as `type_N`. The raw payload is
-  preserved verbatim in the JSONL so if the encoding changes, no data
-  loss, only cosmetic.
-- **Workspace mapping is best-effort.** Cursor stores `workspaceId`
-  pointing into `workspaceStorage/<hash>/workspace.json` — if the
-  workspace was removed, the hint falls back to the raw id.
-- **No deletion.** Thoth never deletes anything from source stores. If
-  you want to GC an archive output directory, do it yourself.
+- **Never mutates** provider stores, credentials, or authorization.
+- **Cursor DB may be locked**; opened with RO URI + WAL-safe fallbacks.
+- **No deletion** of source or archive history by Thoth.
+- Temporary HYDRA Codex Mosaic ([hydra#107](https://github.com/Stimurid/hydra/pull/107)) is a read-only donor until audited parity — do not auto-merge/delete.
 
 ## License
 
@@ -116,5 +108,5 @@ MIT. See `LICENSE`.
 
 ## Related
 
-- [Nisaba](https://github.com/Stimurid/nisaba) — ChatGPT web account cold archive.
-  Companion tool with the same output discipline.
+- [Nisaba](https://github.com/Stimurid/nisaba) — ChatGPT web account cold archive
+- [HYDRA integration contract](docs/HYDRA_INTEGRATION.md)
