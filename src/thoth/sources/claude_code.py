@@ -5,8 +5,6 @@ On-disk shape (observed 2026-10-10):
 
 The <project-slug> is the absolute path of the project directory with
 `/` replaced by `--`, prefixed by `C--` on Windows. One jsonl per session.
-Events include `queue-operation`, `tool-use`, `assistant-message`,
-`user-message`, etc. Timestamps are present on most events.
 """
 from __future__ import annotations
 
@@ -15,19 +13,29 @@ import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from thoth.common import SessionRecord, to_iso_utc
+from thoth.common import (
+    CAPTURE_FULL,
+    CAPTURE_PARTIAL,
+    SessionRecord,
+    append_index,
+    fingerprint_carriers,
+    load_session_ledger,
+    next_version,
+    should_emit,
+    to_iso_utc,
+    write_manifest,
+    write_session,
+)
 
 
-DEFAULT_HOME = Path(os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude" / "projects"))
+def _default_home() -> Path:
+    return Path(os.environ.get("CLAUDE_HOME") or (Path.home() / ".claude" / "projects"))
 
 
 def _unslug_project(slug: str) -> str:
     """Reverse the <project-slug> encoding back to a readable path. Best-effort."""
-    # On Windows, slug looks like C--projects-tools or C--Users-Homee-Projects-...
     s = slug
-    # First `--` is drive separator on Windows, rest are `/` within path.
-    if len(s) >= 2 and s[1] == '-' and s[0].isalpha():
-        # "C--" -> "C:/"
+    if len(s) >= 2 and s[1] == "-" and s[0].isalpha():
         s = f"{s[0]}:/{s[3:]}"
         s = s.replace("--", "/")
     else:
@@ -58,11 +66,23 @@ def _parse_session_file(path: Path, project_hint: str) -> Optional[SessionRecord
     except OSError:
         return None
     if not events:
-        return None
+        return SessionRecord(
+            source="claude-code",
+            session_id=path.stem,
+            title=f"claude-code session {path.stem[:12]}",
+            created_at=None,
+            updated_at=None,
+            project_hint=project_hint,
+            message_count=0,
+            carrier_paths=[str(path)],
+            capture_status=CAPTURE_PARTIAL,
+            content_fingerprint=fingerprint_carriers([str(path)]),
+            events=[],
+            extra={"error": "empty_or_unreadable"},
+        )
 
     sid = path.stem
 
-    # title: first non-queue event's text or a prompt-looking field
     title = ""
     for e in events[:60]:
         t = e.get("type") or ""
@@ -103,8 +123,11 @@ def _parse_session_file(path: Path, project_hint: str) -> Optional[SessionRecord
         project_hint=project_hint,
         message_count=len(events),
         carrier_paths=[str(path)],
-        extra={},
+        capture_status=CAPTURE_FULL,
+        content_fingerprint=fingerprint_carriers([str(path)]),
+        native_thread_id=sid,
         events=events,
+        extra={},
     )
 
 
@@ -113,16 +136,18 @@ def collect(
     *,
     home: Optional[Path] = None,
     since: Optional[str] = None,
+    full: bool = False,
 ) -> Dict[str, Any]:
-    home = home or DEFAULT_HOME
+    home = home or _default_home()
     if not home.is_dir():
         return {"source": "claude-code", "skipped": True, "reason": f"home not found: {home}"}
 
-    from thoth.common import write_session, append_index, write_manifest
-
+    ledger = load_session_ledger(out_root, "claude-code")
     rows: List[Dict[str, Any]] = []
     new_count = 0
+    skipped_unchanged = 0
     skipped_old = 0
+    partial_count = 0
     total_files = 0
 
     for proj_dir in _iter_project_dirs(home):
@@ -133,12 +158,22 @@ def collect(
             total_files += 1
             rec = _parse_session_file(p, hint)
             if rec is None:
+                partial_count += 1
                 continue
-            if since and (rec.updated_at or rec.created_at or "") <= since:
-                skipped_old += 1
+            if rec.capture_status == CAPTURE_PARTIAL:
+                partial_count += 1
+            emit, reason = should_emit(rec, ledger, since=since, force=full)
+            if not emit:
+                if reason == "unchanged_fingerprint":
+                    skipped_unchanged += 1
+                else:
+                    skipped_old += 1
                 continue
+            ver = next_version(ledger, rec.identity_key())
             write_session(out_root, rec)
-            rows.append(rec.index_row())
+            row = rec.index_row(version=ver)
+            rows.append(row)
+            ledger[rec.identity_key()] = row
             new_count += 1
 
     if rows:
@@ -147,13 +182,19 @@ def collect(
         "home": str(home),
         "scanned_files": total_files,
         "new_sessions_this_run": new_count,
+        "skipped_unchanged": skipped_unchanged,
         "skipped_as_old": skipped_old,
+        "partial_this_run": partial_count,
         "since_watermark": since,
+        "unique_sessions_indexed": len(load_session_ledger(out_root, "claude-code")),
     })
     return {
         "source": "claude-code",
         "home": str(home),
         "scanned_files": total_files,
         "new_sessions_this_run": new_count,
+        "skipped_unchanged": skipped_unchanged,
         "skipped_as_old": skipped_old,
+        "partial_this_run": partial_count,
+        "unique_sessions": len(load_session_ledger(out_root, "claude-code")),
     }
