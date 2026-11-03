@@ -2,11 +2,16 @@
 from __future__ import annotations
 import json
 import os
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
+
+# Same commit-marker verifier as Thoth CLI, no duplicate generation policy.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from thoth.common import verify_unified_generation
 
 mcp = MCPServer("thoth-unified-corpus")
 RO = ToolAnnotations(read_only_hint=True, destructive_hint=False,
@@ -22,6 +27,9 @@ def _rows():
     root = Path(value)
     if not root.is_absolute() or not root.is_dir() or root.is_symlink():
         raise RuntimeError("THOTH_ROOT_INVALID")
+    generation = verify_unified_generation(root)
+    if generation.get("status") == "INCOMPLETE":
+        raise RuntimeError("THOTH_CATALOG_GENERATION_INCOMPLETE:" + str(generation.get("reason")))
     catalog = root / "unified_catalog.jsonl"
     if not catalog.is_file() or catalog.is_symlink() or catalog.stat().st_size > 64_000_000:
         raise RuntimeError("THOTH_CATALOG_UNAVAILABLE")

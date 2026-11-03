@@ -72,6 +72,17 @@ class ThothMcpTests(unittest.TestCase):
         self.assertEqual(p["matching"], 3)
         self.assertTrue(all(not row["owner_reviewed_merge"] for row in p["projects"]))
 
+    def test_mcp_rejects_uncommitted_source_generation(self):
+        marker = self.root / "unified_catalog.manifest.json"
+        digest = self.root / "daily_digest.jsonl"
+        digest.write_text("[]\n", encoding="utf-8")
+        marker.write_text(json.dumps({
+            "committed": True, "catalog_sha256": "0" * 64,
+            "digest_sha256": "0" * 64
+        }), encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "THOTH_CATALOG_GENERATION_INCOMPLETE"):
+            app.status()
+
     def test_inputs_and_missing_config(self):
         with self.assertRaises(ValueError):
             app.search_sessions("x" * 161)

@@ -118,9 +118,14 @@ def _conv_to_record(
     # Conversation IDs come from external archive listings, not our own paths.
     # Never accept traversal, a drive prefix, or a path-like value here.
     valid_cid = bool(_UUID.fullmatch(cid))
-    cdir = nisaba_root / "conversations" / (cid if valid_cid else "_invalid_id_")
-    # A valid UUID directory can itself be a symlink; do not follow it.
-    if valid_cid and (cdir.is_symlink() or not cdir.resolve().is_relative_to((nisaba_root / "conversations").resolve())):
+    conversations_root = nisaba_root / "conversations"
+    # The base directory itself may be a symlink outside the archive. Never
+    # trust containment relative to that resolved symlink target.
+    safe_base = (not conversations_root.is_symlink() and
+                 conversations_root.resolve().is_relative_to(nisaba_root.resolve()))
+    valid_cid = valid_cid and safe_base
+    cdir = conversations_root / (cid if valid_cid else "_invalid_id_")
+    if valid_cid and (cdir.is_symlink() or not cdir.resolve().is_relative_to(nisaba_root.resolve())):
         valid_cid = False
     conv_json = cdir / "conversation.json"
     md_path = cdir / "conversation.md"

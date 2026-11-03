@@ -65,6 +65,23 @@ class ReviewRegressions(unittest.TestCase):
         }), "CODEX_VSCODE")
         self.assertEqual(_codex_session_kind({}), "UNKNOWN")
 
+    def test_nisaba_symlink_parent_is_rejected_even_with_valid_uuid(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "archive"
+            write_listing(root, {"conversation_id": UUID, "title": "Source",
+                        "update_time": "2026-11-01T00:00:00Z"}, raw=False)
+            out = Path(tmp) / "out"
+            actual = Path.is_symlink
+            with patch.object(Path, "is_symlink",
+                              lambda self: self.name == "conversations" or actual(self)):
+                result = collect_nisaba(out, nisaba_roots=[root],
+                                        nisaba_accounts=["primary"])
+            self.assertEqual(result["per_account"][0]["partial_this_run"], 1)
+            item = next(iter(load_session_ledger(out, "chatgpt").values()))
+            self.assertEqual(item["capture_status"], "PARTIAL")
+            self.assertEqual(item["carrier_paths"], [])
+
     def test_nisaba_path_traversal_does_not_read_outside_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
