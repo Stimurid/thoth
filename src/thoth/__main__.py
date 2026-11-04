@@ -27,14 +27,14 @@ def _run_source(
     full: bool = False,
 ) -> Dict[str, Any]:
     if src == "codex":
-        from thoth.sources.codex import collect
-        return collect(out, since=watermark, full=full)
+        from thoth.sources.gui_dialogues import collect_codex_gui
+        return collect_codex_gui(out, since=watermark, full=full)
     if src == "claude-code":
-        from thoth.sources.claude_code import collect
-        return collect(out, since=watermark, full=full)
+        from thoth.sources.gui_dialogues import collect_claude_gui
+        return collect_claude_gui(out, since=watermark, full=full)
     if src == "cursor":
-        from thoth.sources.cursor import collect
-        return collect(out, since=watermark, full=full)
+        from thoth.sources.gui_dialogues import collect_cursor_gui
+        return collect_cursor_gui(out, since=watermark, full=full)
     if src == "chatgpt":
         from thoth.sources.nisaba_archive import collect
         if not nisaba_roots:
@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="python -m thoth",
         description=(
-            "Cold-archive AI agent chats stored locally on disk, and (optionally) "
+            "Index only verified human GUI conversations, and (optionally) "
             "one or more Nisaba ChatGPT archives, into one provenance-aware index."
         ),
     )
